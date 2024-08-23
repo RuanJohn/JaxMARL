@@ -153,6 +153,8 @@ class SMAX(MultiAgentEnv):
     ) -> None:
         self.num_allies = num_allies if scenario is None else scenario.num_allies
         self.num_enemies = num_enemies if scenario is None else scenario.num_enemies
+        self.enemies_killed_bonus = 1./self.num_enemies
+        self.allies_died_penalty = 1./self.num_allies
         self.num_agents = self.num_allies + self.num_enemies
         self.walls_cause_death = walls_cause_death
         self.unit_type_names = unit_type_names
@@ -483,26 +485,37 @@ class SMAX(MultiAgentEnv):
                 )
 
             elif self.reward_type == "partial_sparse":
-                # have a lost battle bonus in addition to the won bonus in
-                # order to make the game zero-sum in self-play and therefore prevent any
-                # collaboration.
-                lost_battle_bonus = jax.lax.cond(
-                    lost_battle & self.use_self_play_reward & ~won_battle,
-                    lambda: -self.won_battle_bonus,
-                    lambda: 0.0,
-                )
-                # only award the won_battle_bonus when all the enemy is dead
-                # AND there is at least one ally alive. Otherwise it's a draw.
-                # This can't happen in SC2 because actions happen in a random order,
-                # but I'd rather VMAP over events where possible, which means we
-                # can get draws.
                 won_battle_bonus = jax.lax.cond(
-                    won_battle & ~lost_battle,
-                    lambda: self.won_battle_bonus,
-                    lambda: 0.0,
+                    won_battle & ~lost_battle, lambda: 1.0, lambda: 0.0
+                )
+                lost_battle_bonus = jax.lax.cond(
+                    lost_battle & ~won_battle, lambda: -1.0, lambda: 0.0
+                )
+                
+                enemies_killed = jnp.sum(
+                    jax.lax.dynamic_slice_in_dim(
+                        agents_alive_before - agents_alive_after,
+                        other_team_start_idx,
+                        enemy_team_size,
+                    )
+                )
+                enemies_killed_reward = jax.lax.cond(
+                    ~won_battle, enemies_killed * self.enemies_killed_bonus, 0.0
                 )
 
-                total_reward = won_battle_bonus + lost_battle_bonus
+                # allies_died = jnp.sum(
+                #     jax.lax.dynamic_slice_in_dim(
+                #         alive_before - alive_after,
+                #         team_start_idx,
+                #         team_size,
+                #     )
+                # )
+
+                # allies_died_reward = jax.lax.select(
+                #     self.sparse_reward, allies_died * -self.allies_died_penalty, 0.0
+                # )
+
+                total_reward = won_battle_bonus + lost_battle_bonus + enemies_killed_reward
 
             return total_reward
 
