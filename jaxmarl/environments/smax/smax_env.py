@@ -98,6 +98,12 @@ MAP_NAME_TO_SCENARIO = {
     "smacv2_20_units": Scenario(jnp.zeros((40,), dtype=jnp.uint8), 20, 20, True, True),
 }
 
+POSSIBLE_REWARD_TYPES = [
+    "dense",
+    "sparse",
+    "partial_sparse",
+]
+
 
 def map_name_to_scenario(map_name):
     """maps from smac map names to a scenario array"""
@@ -143,6 +149,7 @@ class SMAX(MultiAgentEnv):
         smacv2_unit_type_generation=False,
         observation_type="unit_list",
         action_type="discrete",
+        reward_type="dense",
     ) -> None:
         self.num_allies = num_allies if scenario is None else scenario.num_allies
         self.num_enemies = num_enemies if scenario is None else scenario.num_enemies
@@ -168,6 +175,13 @@ class SMAX(MultiAgentEnv):
         self.max_steps = max_steps
         self.won_battle_bonus = won_battle_bonus
         self.see_enemy_actions = see_enemy_actions
+        self.reward_type = reward_type
+
+        if self.reward_type not in POSSIBLE_REWARD_TYPES:
+            raise ValueError(
+                f"Invalid reward type {self.reward_type}. Must be one of {POSSIBLE_REWARD_TYPES}"
+            )
+
         self.smacv2_unit_type_generation = (
             smacv2_unit_type_generation
             if scenario is None
@@ -262,12 +276,17 @@ class SMAX(MultiAgentEnv):
     def reset(self, key: chex.PRNGKey) -> Tuple[Dict[str, chex.Array], State]:
         """Environment-specific reset."""
         key, team_0_key, team_1_key = jax.random.split(key, num=3)
-        team_0_start = jnp.stack([jnp.array([self.map_width / 4, self.map_height / 2])] * self.num_allies)
+        team_0_start = jnp.stack(
+            [jnp.array([self.map_width / 4, self.map_height / 2])] * self.num_allies
+        )
         team_0_start_noise = jax.random.uniform(
             team_0_key, shape=(self.num_allies, 2), minval=-2, maxval=2
         )
         team_0_start = team_0_start + team_0_start_noise
-        team_1_start = jnp.stack([jnp.array([self.map_width / 4 * 3, self.map_height / 2])] * self.num_enemies)
+        team_1_start = jnp.stack(
+            [jnp.array([self.map_width / 4 * 3, self.map_height / 2])]
+            * self.num_enemies
+        )
         team_1_start_noise = jax.random.uniform(
             team_1_key, shape=(self.num_enemies, 2), minval=-2, maxval=2
         )
@@ -335,6 +354,7 @@ class SMAX(MultiAgentEnv):
         """Environment-specific step transition."""
 
         health_before = jnp.copy(state.unit_health)
+        agents_alive_before = jnp.copy(state.unit_alive)
 
         def world_step_fn(carry, _):
             state, step_key = carry
@@ -358,6 +378,7 @@ class SMAX(MultiAgentEnv):
             length=self.world_steps_per_env_step,
         )
         health_after = state.unit_health
+        agents_alive_after = state.unit_alive
         state = state.replace(
             terminal=self.is_terminal(state),
             prev_movement_actions=actions[0],
@@ -368,7 +389,7 @@ class SMAX(MultiAgentEnv):
         dones = {
             agent: ~state.unit_alive[self.agent_ids[agent]] for agent in self.agents
         }
-        rewards = self.compute_reward(state, health_before, health_after)
+        rewards = self.compute_reward(state, health_before, health_after, agents_alive_before, agents_alive_after)
         dones["__all__"] = state.terminal
         world_state = self.get_world_state(state)
         infos = {}
@@ -385,7 +406,7 @@ class SMAX(MultiAgentEnv):
             return states
 
     @partial(jax.jit, static_argnums=(0,))
-    def compute_reward(self, state, health_before, health_after):
+    def compute_reward(self, state, health_before, health_after, agents_alive_before, agents_alive_after):
         @partial(jax.jit, static_argnums=(0,))
         def compute_team_reward(team_idx):
             # compute how much the enemy team health has decreased
@@ -397,20 +418,6 @@ class SMAX(MultiAgentEnv):
 
             enemy_team_size = self.num_enemies if team_idx == 0 else self.num_allies
 
-            enemy_health_decrease = jnp.sum(
-                jax.lax.dynamic_slice_in_dim(
-                    (health_after - health_before)
-                    / self.unit_type_health[state.unit_types],
-                    other_team_start_idx,
-                    enemy_team_size,
-                )
-            )
-            enemy_health_decrease_reward = (
-                jnp.abs(enemy_health_decrease) / enemy_team_size
-            )
-            enemy_health_decrease_reward = jax.lax.select(
-                self.use_self_play_reward, 0.0, enemy_health_decrease_reward
-            )
             won_battle = jnp.all(
                 jnp.logical_not(
                     jax.lax.dynamic_slice_in_dim(
@@ -425,23 +432,79 @@ class SMAX(MultiAgentEnv):
                     )
                 )
             )
-            # have a lost battle bonus in addition to the won bonus in
-            # order to make the game zero-sum in self-play and therefore prevent any
-            # collaboration.
-            lost_battle_bonus = jax.lax.cond(
-                lost_battle & self.use_self_play_reward & ~won_battle,
-                lambda: -self.won_battle_bonus,
-                lambda: 0.0,
-            )
-            # only award the won_battle_bonus when all the enemy is dead
-            # AND there is at least one ally alive. Otherwise it's a draw.
-            # This can't happen in SC2 because actions happen in a random order,
-            # but I'd rather VMAP over events where possible, which means we
-            # can get draws.
-            won_battle_bonus = jax.lax.cond(
-                won_battle & ~lost_battle, lambda: self.won_battle_bonus, lambda: 0.0
-            )
-            return enemy_health_decrease_reward + won_battle_bonus + lost_battle_bonus
+
+            if self.reward_type == "sparse":
+                won_battle_bonus = jax.lax.cond(
+                    won_battle & ~lost_battle, lambda: 1.0, lambda: 0.0
+                )
+                lost_battle_bonus = jax.lax.cond(
+                    lost_battle & ~won_battle, lambda: -1.0, lambda: 0.0
+                )
+                total_reward = won_battle_bonus + lost_battle_bonus
+
+            elif self.reward_type == "dense":
+
+                enemy_health_decrease = jnp.sum(
+                    jax.lax.dynamic_slice_in_dim(
+                        (health_after - health_before)
+                        / self.unit_type_health[state.unit_types],
+                        other_team_start_idx,
+                        enemy_team_size,
+                    )
+                )
+                enemy_health_decrease_reward = (
+                    jnp.abs(enemy_health_decrease) / enemy_team_size
+                )
+                enemy_health_decrease_reward = jax.lax.select(
+                    self.use_self_play_reward, 0.0, enemy_health_decrease_reward
+                )
+
+                # have a lost battle bonus in addition to the won bonus in
+                # order to make the game zero-sum in self-play and therefore prevent any
+                # collaboration.
+                lost_battle_bonus = jax.lax.cond(
+                    lost_battle & self.use_self_play_reward & ~won_battle,
+                    lambda: -self.won_battle_bonus,
+                    lambda: 0.0,
+                )
+                # only award the won_battle_bonus when all the enemy is dead
+                # AND there is at least one ally alive. Otherwise it's a draw.
+                # This can't happen in SC2 because actions happen in a random order,
+                # but I'd rather VMAP over events where possible, which means we
+                # can get draws.
+                won_battle_bonus = jax.lax.cond(
+                    won_battle & ~lost_battle,
+                    lambda: self.won_battle_bonus,
+                    lambda: 0.0,
+                )
+
+                total_reward = (
+                    enemy_health_decrease_reward + won_battle_bonus + lost_battle_bonus
+                )
+
+            elif self.reward_type == "partial_sparse":
+                # have a lost battle bonus in addition to the won bonus in
+                # order to make the game zero-sum in self-play and therefore prevent any
+                # collaboration.
+                lost_battle_bonus = jax.lax.cond(
+                    lost_battle & self.use_self_play_reward & ~won_battle,
+                    lambda: -self.won_battle_bonus,
+                    lambda: 0.0,
+                )
+                # only award the won_battle_bonus when all the enemy is dead
+                # AND there is at least one ally alive. Otherwise it's a draw.
+                # This can't happen in SC2 because actions happen in a random order,
+                # but I'd rather VMAP over events where possible, which means we
+                # can get draws.
+                won_battle_bonus = jax.lax.cond(
+                    won_battle & ~lost_battle,
+                    lambda: self.won_battle_bonus,
+                    lambda: 0.0,
+                )
+
+                total_reward = won_battle_bonus + lost_battle_bonus
+
+            return total_reward
 
         # agents still get reward when they are dead to allow for noble sacrifice
         team_rewards = [compute_team_reward(i) for i in range(2)]
@@ -957,7 +1020,10 @@ class SMAX(MultiAgentEnv):
         for key, state, actions in state_seq:
             states = self.step_env(key, state, actions, get_state_sequence=True)
             states = list(map(State, *dataclasses.astuple(states)))
-            viz_actions = {agent: states[0].prev_attack_actions[i] for i, agent in enumerate(self.agents)}
+            viz_actions = {
+                agent: states[0].prev_attack_actions[i]
+                for i, agent in enumerate(self.agents)
+            }
             expanded_state_seq.extend(
                 zip([key] * len(states), states, [viz_actions] * len(states))
             )
