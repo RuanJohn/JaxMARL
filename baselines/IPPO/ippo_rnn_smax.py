@@ -411,8 +411,7 @@ def make_train(config):
             rng = update_state[-1]
 
             def callback(metric):
-                wandb.log(
-                    {
+                results = {
                         # the metrics have an agent dimension, but this is identical
                         # for all agents so index into the 0th item of that dimension.
                         "returns": metric["returned_episode_returns"][:, :, 0][
@@ -426,7 +425,7 @@ def make_train(config):
                         * config["NUM_STEPS"],
                         **metric["loss"],
                     }
-                )
+                jax.debug.print("Returns: {x}, Win Rate: {y}", x=results["returns"], y=results["win_rate"])
 
             metric["update_steps"] = update_steps
             jax.experimental.io_callback(callback, None, metric)
